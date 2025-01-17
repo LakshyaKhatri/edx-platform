@@ -421,7 +421,6 @@ class UnenrollmentView(APIView):
             If the request is successful, an HTTP 200 "OK" response is
             returned along with a list of all courses from which the user was unenrolled.
         """
-    authentication_classes = (JwtAuthentication,)
     permission_classes = (permissions.IsAuthenticated, CanRetireUser,)
 
     def post(self, request):
@@ -1023,9 +1022,6 @@ class EnrollmentAllowedView(APIView):
     """
     A view that allows the retrieval and creation of enrollment allowed for a given user email and course id.
     """
-    authentication_classes = (
-        JwtAuthentication,
-    )
     permission_classes = (permissions.IsAdminUser,)
     throttle_classes = (EnrollmentUserThrottle,)
     serializer_class = CourseEnrollmentAllowedSerializer
@@ -1066,7 +1062,9 @@ class EnrollmentAllowedView(APIView):
 
         **Example Request**
 
-        POST /api/enrollment/v1/enrollment_allowed
+        POST /api/enrollment/v1/enrollment_allowed/
+
+        Note: The URL for this request must finish with /
 
         Example request data:
         ```
@@ -1086,7 +1084,6 @@ class EnrollmentAllowedView(APIView):
         - `auto_enroll` (optional, bool: default=false, _body_)
 
         **Responses**
-        - 200: Success, enrollment allowed found.
         - 400: Bad request, missing data.
         - 403: Forbidden, you need to be staff.
         - 409: Conflict, enrollment allowed already exists.
@@ -1122,7 +1119,9 @@ class EnrollmentAllowedView(APIView):
 
         **Example Request**
 
-        DELETE /api/enrollment/v1/enrollment_allowed
+        DELETE /api/enrollment/v1/enrollment_allowed/
+
+        Note: The URL for this request must finish with /
 
         Example request data:
         ```
