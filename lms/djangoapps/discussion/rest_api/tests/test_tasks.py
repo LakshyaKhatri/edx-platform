@@ -2,30 +2,38 @@
 Test cases for tasks.py
 """
 from unittest import mock
-from django.conf import settings
-from edx_toggles.toggles.testutils import override_waffle_flag
+from unittest.mock import Mock
 
 import ddt
 import httpretty
+from django.conf import settings
+from edx_toggles.toggles.testutils import override_waffle_flag
+from openedx_events.learning.signals import COURSE_NOTIFICATION_REQUESTED, USER_NOTIFICATION_REQUESTED
+
 from common.djangoapps.student.models import CourseEnrollment
 from common.djangoapps.student.tests.factories import StaffFactory, UserFactory
 from lms.djangoapps.discussion.django_comment_client.tests.factories import RoleFactory
-from lms.djangoapps.discussion.rest_api.tasks import send_response_notifications, send_thread_created_notification
+from lms.djangoapps.discussion.rest_api.tasks import (
+    send_response_endorsed_notifications,
+    send_response_notifications,
+    send_thread_created_notification
+)
 from lms.djangoapps.discussion.rest_api.tests.utils import ThreadMock, make_minimal_cs_thread
 from openedx.core.djangoapps.course_groups.models import CohortMembership, CourseCohortsSettings
 from openedx.core.djangoapps.course_groups.tests.helpers import CohortFactory
+from openedx.core.djangoapps.discussions.models import DiscussionTopicLink
 from openedx.core.djangoapps.django_comment_common.models import (
-    CourseDiscussionSettings,
     FORUM_ROLE_COMMUNITY_TA,
     FORUM_ROLE_GROUP_MODERATOR,
     FORUM_ROLE_MODERATOR,
     FORUM_ROLE_STUDENT,
+    CourseDiscussionSettings
 )
-from openedx.core.djangoapps.discussions.models import DiscussionTopicLink
 from openedx.core.djangoapps.notifications.config.waffle import ENABLE_NOTIFICATIONS
-from openedx_events.learning.signals import USER_NOTIFICATION_REQUESTED
 from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
 from xmodule.modulestore.tests.factories import CourseFactory
+
+from ..discussions_notifications import DiscussionNotificationSender
 from .test_views import DiscussionAPIViewTestMixin
 
 
@@ -44,15 +52,33 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
     """
     Test cases related to new_discussion_post and new_question_post notification types
     """
+
     def setUp(self):
         """
         Setup test case
         """
         super().setUp()
-
+        patcher = mock.patch(
+            'openedx.core.djangoapps.discussions.config.waffle.ENABLE_FORUM_V2.is_enabled',
+            return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # Creating a course
         self.course = CourseFactory.create()
 
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.thread.forum_api.get_course_id_by_thread",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_thread = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.models.forum_api.get_course_id_by_comment",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_comment = patcher.start()
+        self.addCleanup(patcher.stop)
         # Creating relative discussion and cohort settings
         CourseCohortsSettings.objects.create(course_id=str(self.course.id))
         CourseDiscussionSettings.objects.create(course_id=str(self.course.id), _divided_discussions='[]')
@@ -153,14 +179,6 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
         self.register_get_thread_response(thread)
         return thread
 
-    def assert_users_id_list(self, user_ids_1, user_ids_2):
-        """
-        Assert whether the user ids in two lists are same
-        """
-        assert len(user_ids_1) == len(user_ids_2)
-        for user_id in user_ids_1:
-            assert user_id in user_ids_2
-
     def test_basic(self):
         """
         Left empty intentionally. This test case is inherited from DiscussionAPIViewTestMixin
@@ -171,15 +189,6 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
         Left empty intentionally. This test case is inherited from DiscussionAPIViewTestMixin
         """
 
-    def test_no_notification_if_course_has_no_enrollments(self):
-        """
-        Tests no notification is send if course has no enrollments
-        """
-        handler = mock.Mock()
-        USER_NOTIFICATION_REQUESTED.connect(handler)
-        send_thread_created_notification(self.thread['id'], str(self.course.id), self.author.id)
-        self.assertEqual(handler.call_count, 0)
-
     @ddt.data(
         ('new_question_post',),
         ('new_discussion_post',),
@@ -187,7 +196,7 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
     @ddt.unpack
     def test_notification_is_send_to_all_enrollments(self, notification_type):
         """
-        Tests notification is send to all users if course is not cohorted
+        Tests notification is sent to all users if course is not cohorted
         """
         self._assign_enrollments()
         thread_type = (
@@ -197,12 +206,13 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
         )
         thread = self._create_thread(thread_type=thread_type)
         handler = mock.Mock()
-        USER_NOTIFICATION_REQUESTED.connect(handler)
+        COURSE_NOTIFICATION_REQUESTED.connect(handler)
         send_thread_created_notification(thread['id'], str(self.course.id), self.author.id)
         self.assertEqual(handler.call_count, 1)
-        assert notification_type == handler.call_args[1]['notification_data'].notification_type
-        user_ids_list = [user.id for user in self.notification_to_all_users]
-        self.assert_users_id_list(user_ids_list, handler.call_args[1]['notification_data'].user_ids)
+        course_notification_data = handler.call_args[1]['course_notification_data']
+        assert notification_type == course_notification_data.notification_type
+        notification_audience_filters = {}
+        assert notification_audience_filters == course_notification_data.audience_filters
 
     @ddt.data(
         ('cohort_1', 'new_question_post'),
@@ -213,7 +223,7 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
     @ddt.unpack
     def test_notification_is_send_to_cohort_ids(self, cohort_text, notification_type):
         """
-        Tests if notification is send only to privileged users and cohort members if the
+        Tests if notification is sent only to privileged users and cohort members if the
         course is cohorted
         """
         self._assign_enrollments()
@@ -233,14 +243,20 @@ class TestNewThreadCreatedNotification(DiscussionAPIViewTestMixin, ModuleStoreTe
         cohort_id = cohort.id
         thread = self._create_thread(group_id=cohort_id, thread_type=thread_type)
         handler = mock.Mock()
-        USER_NOTIFICATION_REQUESTED.connect(handler)
+        COURSE_NOTIFICATION_REQUESTED.connect(handler)
         send_thread_created_notification(thread['id'], str(self.course.id), self.author.id)
-        assert notification_type == handler.call_args[1]['notification_data'].notification_type
+        course_notification_data = handler.call_args[1]['course_notification_data']
+        assert notification_type == course_notification_data.notification_type
+        notification_audience_filters = {
+            'cohorts': [cohort_id],
+            'course_roles': ['staff', 'instructor'],
+            'discussion_roles': ['Administrator', 'Moderator', 'Community TA'],
+        }
+        assert notification_audience_filters == handler.call_args[1]['course_notification_data'].audience_filters
         self.assertEqual(handler.call_count, 1)
-        user_ids_list = [user.id for user in audience]
-        self.assert_users_id_list(user_ids_list, handler.call_args[1]['notification_data'].user_ids)
 
 
+@ddt.ddt
 @override_waffle_flag(ENABLE_NOTIFICATIONS, active=True)
 class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestCase):
     """
@@ -251,8 +267,26 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
         super().setUp()
         httpretty.reset()
         httpretty.enable()
+        patcher = mock.patch(
+            'openedx.core.djangoapps.discussions.config.waffle.ENABLE_FORUM_V2.is_enabled',
+            return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.course = CourseFactory.create()
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.thread.forum_api.get_course_id_by_thread",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_thread = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.models.forum_api.get_course_id_by_comment",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_comment = patcher.start()
+        self.addCleanup(patcher.stop)
         self.user_1 = UserFactory.create()
         CourseEnrollment.enroll(self.user_1, self.course.id)
         self.user_2 = UserFactory.create()
@@ -271,7 +305,21 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
                 "username": thread.username,
                 "thread_type": 'discussion',
                 "title": thread.title,
+                "commentable_id": thread.commentable_id,
+
             })
+        self._register_subscriptions_endpoint()
+
+        self.comment = ThreadMock(thread_id=4, creator=self.user_2, title='test comment', body='comment body')
+        self.register_get_comment_response(
+            {
+                'id': self.comment.id,
+                'thread_id': self.thread.id,
+                'parent_id': None,
+                'user_id': self.comment.user_id,
+                'body': self.comment.body,
+            }
+        )
 
     def test_basic(self):
         """
@@ -292,15 +340,27 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
 
         # Post the form or do what it takes to send the signal
 
-        send_response_notifications(self.thread.id, str(self.course.id), self.user_2.id, parent_id=None)
-        self.assertEqual(handler.call_count, 1)
-        args = handler.call_args[1]['notification_data']
+        send_response_notifications(
+            self.thread.id,
+            str(self.course.id),
+            self.user_2.id,
+            self.comment.id,
+            parent_id=None
+        )
+        self.assertEqual(handler.call_count, 2)
+        args = handler.call_args_list[0][1]['notification_data']
         self.assertEqual([int(user_id) for user_id in args.user_ids], [self.user_1.id])
         self.assertEqual(args.notification_type, 'new_response')
         expected_context = {
             'replier_name': self.user_2.username,
             'post_title': 'test thread',
+            'email_content': self.comment.body,
             'course_name': self.course.display_name,
+            'sender_id': self.user_2.id,
+            'parent_id': None,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 4,
         }
         self.assertDictEqual(args.context, expected_context)
         self.assertEqual(
@@ -324,7 +384,13 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
             'user_id': self.thread_2.user_id
         })
 
-        send_response_notifications(self.thread.id, str(self.course.id), self.user_3.id, parent_id=self.thread_2.id)
+        send_response_notifications(
+            self.thread.id,
+            str(self.course.id),
+            self.user_3.id,
+            self.comment.id,
+            parent_id=self.thread_2.id
+        )
         # check if 2 call are made to the handler i.e. one for the response creator and one for the thread creator
         self.assertEqual(handler.call_count, 2)
 
@@ -336,8 +402,15 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
         expected_context = {
             'replier_name': self.user_3.username,
             'post_title': self.thread.title,
+            'email_content': self.comment.body,
             'author_name': 'dummy\'s',
+            'author_pronoun': 'dummy\'s',
             'course_name': self.course.display_name,
+            'sender_id': self.user_3.id,
+            'parent_id': 2,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 4,
         }
         self.assertDictEqual(args_comment.context, expected_context)
         self.assertEqual(
@@ -352,7 +425,13 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
         expected_context = {
             'replier_name': self.user_3.username,
             'post_title': self.thread.title,
+            'email_content': self.comment.body,
             'course_name': self.course.display_name,
+            'sender_id': self.user_3.id,
+            'parent_id': 2,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 4,
         }
         self.assertDictEqual(args_comment_on_response.context, expected_context)
         self.assertEqual(
@@ -363,13 +442,19 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
 
     def test_no_signal_on_creators_own_thread(self):
         """
-        Makes sure that no signal is emitted if user creates response on
+        Makes sure that 1 signal is emitted if user creates response on
         their own thread.
         """
         handler = mock.Mock()
         USER_NOTIFICATION_REQUESTED.connect(handler)
-        send_response_notifications(self.thread.id, str(self.course.id), self.user_1.id, parent_id=None)
-        self.assertEqual(handler.call_count, 0)
+
+        send_response_notifications(
+            self.thread.id,
+            str(self.course.id),
+            self.user_1.id,
+            self.comment.id, parent_id=None
+        )
+        self.assertEqual(handler.call_count, 1)
 
     def test_comment_creators_own_response(self):
         """
@@ -385,9 +470,15 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
             'user_id': self.thread_3.user_id
         })
 
-        send_response_notifications(self.thread.id, str(self.course.id), self.user_3.id, parent_id=self.thread_2.id)
+        send_response_notifications(
+            self.thread.id,
+            str(self.course.id),
+            self.user_3.id,
+            parent_id=self.thread_2.id,
+            comment_id=self.comment.id
+        )
         # check if 1 call is made to the handler i.e. for the thread creator
-        self.assertEqual(handler.call_count, 1)
+        self.assertEqual(handler.call_count, 2)
 
         # check if the notification is sent to the thread creator
         args_comment = handler.call_args_list[0][1]['notification_data']
@@ -396,8 +487,15 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
         expected_context = {
             'replier_name': self.user_3.username,
             'post_title': self.thread.title,
-            'author_name': 'your',
+            'author_name': 'dummy\'s',
+            'author_pronoun': 'your',
             'course_name': self.course.display_name,
+            'sender_id': self.user_3.id,
+            'email_content': self.comment.body,
+            'parent_id': 2,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 4,
         }
         self.assertDictEqual(args_comment.context, expected_context)
         self.assertEqual(
@@ -406,18 +504,115 @@ class TestSendResponseNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestC
         )
         self.assertEqual(args_comment.app_name, 'discussion')
 
+    @ddt.data(
+        (None, 'response_on_followed_post'), (1, 'comment_on_followed_post')
+    )
+    @ddt.unpack
+    def test_send_notification_to_followers(self, parent_id, notification_type):
+        """
+        Test that the notification is sent to the followers of the thread
+        """
+        self.register_get_comment_response({
+            'id': self.thread.id,
+            'thread_id': self.thread.id,
+            'user_id': self.thread.user_id
+        })
+        handler = Mock()
+        USER_NOTIFICATION_REQUESTED.connect(handler)
+
+        # Post the form or do what it takes to send the signal
+        notification_sender = DiscussionNotificationSender(
+            self.thread,
+            self.course,
+            self.user_2,
+            parent_id=parent_id,
+            comment_id=self.comment.id
+        )
+        notification_sender.send_response_on_followed_post_notification()
+        self.assertEqual(handler.call_count, 1)
+        args = handler.call_args[1]['notification_data']
+        # only sent to user_3 because user_2 is the one who created the response
+        self.assertEqual([self.user_3.id], args.user_ids)
+        self.assertEqual(args.notification_type, notification_type)
+        expected_context = {
+            'replier_name': self.user_2.username,
+            'post_title': 'test thread',
+            'email_content': self.comment.body,
+            'course_name': self.course.display_name,
+            'sender_id': self.user_2.id,
+            'parent_id': parent_id,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 4,
+        }
+        if parent_id:
+            expected_context['author_name'] = 'dummy\'s'
+            expected_context['author_pronoun'] = 'dummy\'s'
+        self.assertDictEqual(args.context, expected_context)
+        self.assertEqual(
+            args.content_url,
+            _get_mfe_url(self.course.id, self.thread.id)
+        )
+        self.assertEqual(args.app_name, 'discussion')
+
+    def _register_subscriptions_endpoint(self):
+        """
+        Registers the endpoint for the subscriptions API
+        """
+        mock_response = {
+            'collection': [
+                {
+                    '_id': 1,
+                    'subscriber_id': str(self.user_2.id),
+                    "source_id": self.thread.id,
+                    "source_type": "thread",
+                },
+                {
+                    '_id': 2,
+                    'subscriber_id': str(self.user_3.id),
+                    "source_id": self.thread.id,
+                    "source_type": "thread",
+                },
+            ],
+            'page': 1,
+            'num_pages': 1,
+            'subscriptions_count': 2,
+            'corrected_text': None
+
+        }
+        self.register_get_subscriptions(self.thread.id, mock_response)
+
 
 @override_waffle_flag(ENABLE_NOTIFICATIONS, active=True)
 class TestSendCommentNotification(DiscussionAPIViewTestMixin, ModuleStoreTestCase):
     """
     Test case to send new_comment notification
     """
+
     def setUp(self):
         super().setUp()
         httpretty.reset()
         httpretty.enable()
+        patcher = mock.patch(
+            'openedx.core.djangoapps.discussions.config.waffle.ENABLE_FORUM_V2.is_enabled',
+            return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.course = CourseFactory.create()
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.thread.forum_api.get_course_id_by_thread",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_thread = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.models.forum_api.get_course_id_by_comment",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_comment = patcher.start()
+        self.addCleanup(patcher.stop)
         self.user_1 = UserFactory.create()
         CourseEnrollment.enroll(self.user_1, self.course.id)
         self.user_2 = UserFactory.create()
@@ -442,6 +637,7 @@ class TestSendCommentNotification(DiscussionAPIViewTestMixin, ModuleStoreTestCas
 
         thread = ThreadMock(thread_id=1, creator=self.user_1, title='test thread')
         response = ThreadMock(thread_id=2, creator=self.user_2, title='test response')
+        comment = ThreadMock(thread_id=3, creator=self.user_2, title='test comment', body='comment body')
         self.register_get_thread_response({
             'id': thread.id,
             'course_id': str(self.course.id),
@@ -450,13 +646,148 @@ class TestSendCommentNotification(DiscussionAPIViewTestMixin, ModuleStoreTestCas
             "username": thread.username,
             "thread_type": 'discussion',
             "title": thread.title,
+            "commentable_id": thread.commentable_id,
+
         })
         self.register_get_comment_response({
             'id': response.id,
             'thread_id': thread.id,
             'user_id': response.user_id
         })
-        send_response_notifications(thread.id, str(self.course.id), self.user_2.id, parent_id=response.id)
+        self.register_get_comment_response({
+            'id': comment.id,
+            'parent_id': response.id,
+            'user_id': comment.user_id,
+            'body': comment.body
+        })
+        self.register_get_subscriptions(1, {})
+        send_response_notifications(thread.id, str(self.course.id), self.user_2.id, parent_id=response.id,
+                                    comment_id=comment.id)
         handler.assert_called_once()
         context = handler.call_args[1]['notification_data'].context
-        self.assertEqual(context['author_name'], 'their')
+        self.assertEqual(context['author_name'], 'dummy\'s')
+        self.assertEqual(context['author_pronoun'], 'their')
+        self.assertEqual(context['email_content'], comment.body)
+
+
+@override_waffle_flag(ENABLE_NOTIFICATIONS, active=True)
+class TestResponseEndorsedNotifications(DiscussionAPIViewTestMixin, ModuleStoreTestCase):
+    """
+    Test case to send response endorsed notifications
+    """
+
+    def setUp(self):
+        super().setUp()
+        httpretty.reset()
+        httpretty.enable()
+        patcher = mock.patch(
+            'openedx.core.djangoapps.discussions.config.waffle.ENABLE_FORUM_V2.is_enabled',
+            return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.course = CourseFactory.create()
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.thread.forum_api.get_course_id_by_thread",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_thread = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch(
+            "openedx.core.djangoapps.django_comment_common.comment_client.models.forum_api.get_course_id_by_comment",
+            return_value=self.course.id
+        )
+        self.mock_get_course_id_by_comment = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.user_1 = UserFactory.create()
+        CourseEnrollment.enroll(self.user_1, self.course.id)
+        self.user_2 = UserFactory.create()
+        self.user_3 = UserFactory.create()
+        CourseEnrollment.enroll(self.user_2, self.course.id)
+        CourseEnrollment.enroll(self.user_3, self.course.id)
+
+    def test_basic(self):
+        """
+        Left empty intentionally. This test case is inherited from DiscussionAPIViewTestMixin
+        """
+
+    def test_not_authenticated(self):
+        """
+        Left empty intentionally. This test case is inherited from DiscussionAPIViewTestMixin
+        """
+
+    def test_response_endorsed_notifications(self):
+        """
+        Tests response endorsed notifications
+        """
+        thread = ThreadMock(thread_id=1, creator=self.user_1, title='test thread')
+        response = ThreadMock(thread_id=2, creator=self.user_2, title='test response')
+        self.register_get_thread_response({
+            'id': thread.id,
+            'course_id': str(self.course.id),
+            'topic_id': 'abc',
+            "user_id": thread.user_id,
+            "username": thread.username,
+            "thread_type": 'discussion',
+            "title": thread.title,
+            "commentable_id": thread.commentable_id,
+        })
+        self.register_get_comment_response({
+            'id': 1,
+            'thread_id': thread.id,
+            'user_id': response.user_id
+        })
+        self.register_get_comment_response({
+            'id': 2,
+            'thread_id': thread.id,
+            'user_id': response.user_id
+        })
+        handler = mock.Mock()
+        USER_NOTIFICATION_REQUESTED.connect(handler)
+        send_response_endorsed_notifications(thread.id, response.id, str(self.course.id), self.user_3.id)
+        self.assertEqual(handler.call_count, 2)
+
+        # Test response endorsed on thread notification
+        notification_data = handler.call_args_list[0][1]['notification_data']
+        # Target only the thread author
+        self.assertEqual([int(user_id) for user_id in notification_data.user_ids], [int(thread.user_id)])
+        self.assertEqual(notification_data.notification_type, 'response_endorsed_on_thread')
+
+        expected_context = {
+            'replier_name': self.user_2.username,
+            'post_title': 'test thread',
+            'course_name': self.course.display_name,
+            'sender_id': int(self.user_2.id),
+            'email_content': 'dummy',
+            'parent_id': None,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 2,
+        }
+        self.assertDictEqual(notification_data.context, expected_context)
+        self.assertEqual(notification_data.content_url, _get_mfe_url(self.course.id, thread.id))
+        self.assertEqual(notification_data.app_name, 'discussion')
+        self.assertEqual('response_endorsed_on_thread', notification_data.notification_type)
+
+        # Test response endorsed notification
+        notification_data = handler.call_args_list[1][1]['notification_data']
+        # Target only the response author
+        self.assertEqual([int(user_id) for user_id in notification_data.user_ids], [int(response.user_id)])
+        self.assertEqual(notification_data.notification_type, 'response_endorsed')
+
+        expected_context = {
+            'replier_name': response.username,
+            'post_title': 'test thread',
+            'course_name': self.course.display_name,
+            'sender_id': int(response.user_id),
+            'email_content': 'dummy',
+            'parent_id': None,
+            'topic_id': None,
+            'thread_id': 1,
+            'comment_id': 2,
+        }
+        self.assertDictEqual(notification_data.context, expected_context)
+        self.assertEqual(notification_data.content_url, _get_mfe_url(self.course.id, thread.id))
+        self.assertEqual(notification_data.app_name, 'discussion')
+        self.assertEqual('response_endorsed', notification_data.notification_type)

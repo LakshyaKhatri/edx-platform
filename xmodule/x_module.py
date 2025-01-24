@@ -13,7 +13,8 @@ from django.conf import settings
 from lxml import etree
 from opaque_keys.edx.asides import AsideDefinitionKeyV2, AsideUsageKeyV2
 from opaque_keys.edx.keys import UsageKey
-from pkg_resources import resource_isdir, resource_filename
+from importlib.resources import files, as_file
+from pathlib import Path as P
 from web_fragments.fragment import Fragment
 from webob import Response
 from webob.multidict import MultiDict
@@ -55,9 +56,6 @@ log = logging.getLogger(__name__)
 XMODULE_METRIC_NAME = 'edxapp.xmodule'
 XMODULE_DURATION_METRIC_NAME = XMODULE_METRIC_NAME + '.duration'
 XMODULE_METRIC_SAMPLE_RATE = 0.1
-
-# Stats event sent to DataDog in order to determine if old XML parsing can be deprecated.
-DEPRECATION_VSCOMPAT_EVENT = 'deprecation.vscompat'
 
 # xblock view names
 
@@ -858,32 +856,35 @@ class ResourceTemplates:
     @classmethod
     def get_template_dir(cls):  # lint-amnesty, pylint: disable=missing-function-docstring
         if getattr(cls, 'template_dir_name', None):
-            dirname = os.path.join('templates', cls.template_dir_name)  # lint-amnesty, pylint: disable=no-member
-            if not resource_isdir(__name__, dirname):
+            dirname = os.path.join('templates', cls.template_dir_name)
+            if not os.path.isdir(os.path.join(os.path.dirname(__file__), dirname)):
                 log.warning("No resource directory {dir} found when loading {cls_name} templates".format(
                     dir=dirname,
                     cls_name=cls.__name__,
                 ))
                 return None
-            else:
-                return dirname
-        else:
-            return None
+            return dirname
+        return None
 
     @classmethod
     def get_template_dirpaths(cls):
         """
-        Returns of list of directories containing resource templates.
+        Returns a list of directories containing resource templates.
         """
         template_dirpaths = []
         template_dirname = cls.get_template_dir()
-        if template_dirname and resource_isdir(__name__, template_dirname):
-            template_dirpaths.append(resource_filename(__name__, template_dirname))
+        package, module_path = __name__.split('.', 1)
+        module_dir = str(P(module_path).parent)
+        module_dir = "" if module_dir == "." else module_dir
+        file_dirs = files(package).joinpath(module_dir, template_dirname or "")
+        if template_dirname and file_dirs.is_dir():
+            with as_file(file_dirs) as path:
+                template_dirpaths.append(path)
 
         custom_template_dir = cls.get_custom_template_dir()
         if custom_template_dir:
             template_dirpaths.append(custom_template_dir)
-        return template_dirpaths
+        return [str(td) for td in template_dirpaths]
 
     @classmethod
     def get_custom_template_dir(cls):
@@ -1532,18 +1533,16 @@ class XMLParsingSystem(DescriptorSystem):  # lint-amnesty, pylint: disable=abstr
         super().__init__(**kwargs)
         self.process_xml = process_xml
 
-    def _usage_id_from_node(self, node, parent_id, id_generator=None):
+    def _usage_id_from_node(self, node, parent_id):
         """Create a new usage id from an XML dom node.
 
         Args:
             node (lxml.etree.Element): The DOM node to interpret.
             parent_id: The usage ID of the parent block
-            id_generator (IdGenerator): The :class:`.IdGenerator` to use
-                for creating ids
         Returns:
             UsageKey: the usage key for the new xblock
         """
-        return self.xblock_from_node(node, parent_id, id_generator).scope_ids.usage_id
+        return self.xblock_from_node(node, parent_id, self.id_generator).scope_ids.usage_id
 
     def xblock_from_node(self, node, parent_id, id_generator=None):
         """
@@ -1578,7 +1577,7 @@ class XMLParsingSystem(DescriptorSystem):  # lint-amnesty, pylint: disable=abstr
         aside_children = self.parse_asides(node, def_id, usage_id, id_generator)
         asides_tags = [x.tag for x in aside_children]
 
-        block = block_class.parse_xml(node, self, keys, id_generator)
+        block = block_class.parse_xml(node, self, keys)
         self._convert_reference_fields_to_keys(block)  # difference from XBlock.runtime
         block.parent = parent_id
         block.save()
@@ -1602,7 +1601,7 @@ class XMLParsingSystem(DescriptorSystem):  # lint-amnesty, pylint: disable=abstr
                     aside_children.append(child)
         # now process them & remove them from the xml payload
         for child in aside_children:
-            self._aside_from_xml(child, def_id, usage_id, id_generator)
+            self._aside_from_xml(child, def_id, usage_id)
             node.remove(child)
         return aside_children
 

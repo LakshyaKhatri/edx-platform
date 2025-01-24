@@ -5,24 +5,24 @@ Tests for vertical block.
 # pylint: disable=protected-access
 
 
+import json
 from collections import namedtuple
 from datetime import datetime, timedelta
-import json
 from unittest.mock import Mock, patch
 
-import pytz
 import ddt
-from fs.memoryfs import MemoryFS
+import pytz
 from django.contrib.auth.models import AnonymousUser
 from django.test import override_settings
+from fs.memoryfs import MemoryFS
 from openedx_filters import PipelineStep
 from openedx_filters.learning.filters import VerticalBlockChildRenderStarted, VerticalBlockRenderCompleted
 
+from ..x_module import AUTHOR_VIEW, PUBLIC_VIEW, STUDENT_VIEW
 from . import prepare_block_runtime
 from .helpers import StubUserService
 from .xml import XModuleXmlImportTest
 from .xml import factories as xml
-from ..x_module import STUDENT_VIEW, AUTHOR_VIEW, PUBLIC_VIEW
 
 COMPLETION_DELAY = 9876
 

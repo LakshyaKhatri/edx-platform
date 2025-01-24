@@ -4,12 +4,9 @@ Content Tagging models
 from __future__ import annotations
 
 from django.db import models
-from django.db.models import Exists, OuterRef, Q, QuerySet
+from django.db.models import Q, QuerySet
 from django.utils.translation import gettext as _
-from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import LearningContextKey
-from opaque_keys.edx.locator import BlockUsageLocator
-from openedx_tagging.core.tagging.models import ObjectTag, Taxonomy
+from openedx_tagging.core.tagging.models import Taxonomy
 from organizations.models import Organization
 
 
@@ -19,6 +16,8 @@ class TaxonomyOrg(models.Model):
 
     We keep this as a separate class from ContentTaxonomy so that class can remain a proxy for Taxonomy, keeping the
     data models and usage simple.
+
+    .. no_pii:
     """
 
     class RelType(models.TextChoices):
@@ -67,107 +66,21 @@ class TaxonomyOrg(models.Model):
 
     @classmethod
     def get_organizations(
-        cls, taxonomy: Taxonomy, rel_type: RelType
-    ) -> list[Organization]:
+        cls, taxonomy: Taxonomy, rel_type=RelType.OWNER,
+    ) -> tuple[bool, list[Organization]]:
         """
-        Returns the list of Organizations which have the given relationship to the taxonomy.
+        Returns a tuple containing:
+        * bool: flag indicating whether "all organizations" have the given relationship to the taxonomy
+        * orgs: list of Organizations which have the given relationship to the taxonomy
         """
-        rels = cls.objects.filter(
-            taxonomy=taxonomy,
-            rel_type=rel_type,
-        )
-        # A relationship with org=None means all Organizations
-        if rels.filter(org=None).exists():
-            return list(Organization.objects.all())
-        return [rel.org for rel in rels]
+        is_all_org = False
+        orgs = []
+        # Iterate over the taxonomyorgs instead of filtering to take advantage of prefetched data.
+        for taxonomy_org in taxonomy.taxonomyorg_set.all():
+            if taxonomy_org.rel_type == rel_type:
+                if taxonomy_org.org is None:
+                    is_all_org = True
+                else:
+                    orgs.append(taxonomy_org.org)
 
-
-class ContentObjectTag(ObjectTag):
-    """
-    ObjectTag that requires an LearningContextKey or BlockUsageLocator as the object ID.
-    """
-
-    class Meta:
-        proxy = True
-
-    @property
-    def object_key(self) -> BlockUsageLocator | LearningContextKey:
-        """
-        Returns the object ID parsed as a UsageKey or LearningContextKey.
-        Raises InvalidKeyError object_id cannot be parse into one of those key types.
-
-        Returns None if there's no object_id.
-        """
-        try:
-            return LearningContextKey.from_string(str(self.object_id))
-        except InvalidKeyError:
-            return BlockUsageLocator.from_string(str(self.object_id))
-
-
-class ContentTaxonomyMixin:
-    """
-    Taxonomy which can only tag Content objects (e.g. XBlocks or Courses) via ContentObjectTag.
-
-    Also ensures a valid TaxonomyOrg owner relationship with the content object.
-    """
-
-    @classmethod
-    def taxonomies_for_org(
-        cls,
-        queryset: QuerySet,
-        org: Organization | None = None,
-    ) -> QuerySet:
-        """
-        Filters the given QuerySet to those ContentTaxonomies which are available for the given organization.
-
-        If no `org` is provided, then only ContentTaxonomies available to all organizations are returned.
-        If `org` is provided, then ContentTaxonomies available to this organizations are also returned.
-        """
-        org_short_name = org.short_name if org else None
-        return queryset.filter(
-            Exists(
-                TaxonomyOrg.get_relationships(
-                    taxonomy=OuterRef("pk"),
-                    rel_type=TaxonomyOrg.RelType.OWNER,
-                    org_short_name=org_short_name,
-                )
-            )
-        )
-
-    def _check_object(self, object_tag: ObjectTag) -> bool:
-        """
-        Returns True if this ObjectTag has a valid object_id.
-        """
-        content_tag = ContentObjectTag.cast(object_tag)
-        try:
-            content_tag.object_key
-        except InvalidKeyError:
-            return False
-        return super()._check_object(content_tag)
-
-    def _check_taxonomy(self, object_tag: ObjectTag) -> bool:
-        """
-        Returns True if this taxonomy is owned by the tag's org.
-        """
-        content_tag = ContentObjectTag.cast(object_tag)
-        try:
-            object_key = content_tag.object_key
-        except InvalidKeyError:
-            return False
-        if not TaxonomyOrg.get_relationships(
-            taxonomy=self,
-            rel_type=TaxonomyOrg.RelType.OWNER,
-            org_short_name=object_key.org,
-        ).exists():
-            return False
-        return super()._check_taxonomy(content_tag)
-
-
-class ContentTaxonomy(ContentTaxonomyMixin, Taxonomy):
-    """
-    Taxonomy that accepts ContentTags,
-    and ensures a valid TaxonomyOrg owner relationship with the content object.
-    """
-
-    class Meta:
-        proxy = True
+        return (is_all_org, orgs)
